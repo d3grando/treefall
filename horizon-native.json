@@ -1,8 +1,8 @@
 {
   "game": "26.3",
-  "horizon": "83f15fa276c44711276b6ceb5f0fe0c9c534dc66",
+  "horizon": "142388e1c136e622652ec7505af15d8ad195e041",
   "id": "treefall",
-  "mixins": "0500ff24aa5933fca95a877ef41125353c4b4fe3",
+  "mixins": "0d6b103c70633d8fd9443d8d0acd3aadaacedb06",
   "schema": 1,
-  "version": "0.2.0"
+  "version": "0.3.0"
 }

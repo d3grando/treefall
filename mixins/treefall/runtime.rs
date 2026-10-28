@@ -12,8 +12,15 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 pub type Position = [i32; 3];
 pub type Actor = [i32; 4];
 
-/// Environment variable naming the JSON configuration file.
-pub const CONFIG_ENV: &str = "HORIZON_TREEFALL_CONFIG";
+/// The mod's id: its row in Options > Mods and its settings folder
+/// (`horizon-mods/.horizon-mod-data/treefall/`).
+pub const ID: &str = "treefall";
+pub const VERSION: &str = "0.3.0";
+pub const DESCRIPTION: &str =
+    "Cut one log of a natural tree with an axe and the whole tree comes down.";
+/// The configuration, in the mod's settings folder: what the settings page
+/// writes, and where the woods lists are edited by hand.
+pub const CONFIG_FILE: &str = "config.json";
 /// The chat command (without its slash).
 pub const COMMAND: &str = "treefall";
 pub const USAGE: &str = "Usage: /treefall [status|on|off|toggle|reload]";
@@ -173,6 +180,12 @@ impl Config {
         let config: Self = serde_json::from_str(source).map_err(|e| e.to_string())?;
         config.validate()?;
         Ok(config)
+    }
+    /// The file the settings page writes: every key, readable by `from_json`.
+    pub fn to_json(&self) -> String {
+        let mut json = serde_json::to_string_pretty(self).unwrap_or_default();
+        json.push('\n');
+        json
     }
     pub fn validate(&self) -> Result<(), String> {
         let within = |v: f32, lo: f32, hi: f32| v.is_finite() && (lo..=hi).contains(&v);
@@ -507,7 +520,8 @@ pub fn decaying_leaves<W: Blocks + ?Sized>(
 /// A tree that will be felled.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Plan {
-    /// The block the player broke; always broken first, as the game would.
+    /// The block the player broke; broken last, as the game would, once the
+    /// logs above it are down.
     pub origin: (Position, Block),
     /// The other logs, highest first (so a stop leaves a standing stump).
     pub logs: Vec<(Position, Block)>,
@@ -659,14 +673,21 @@ pub struct SpeedKey {
     pub item: Option<String>,
 }
 
-/// Per-world runtime state: the players who turned TreeFall off, and the
-/// last felling-speed answer (mining asks every tick).
+/// Runtime state: the players who turned TreeFall off (until the game
+/// closes), and the last felling-speed answer (mining asks every tick).
 #[derive(Default)]
 pub struct Runtime {
     disabled: BTreeSet<Actor>,
     speed: Option<(SpeedKey, i64, f32)>,
 }
 impl Runtime {
+    /// No one turned off and nothing cached (`Default`, usable in a `static`).
+    pub const fn new() -> Self {
+        Self {
+            disabled: BTreeSet::new(),
+            speed: None,
+        }
+    }
     pub fn enabled(&self, actor: Actor) -> bool {
         !self.disabled.contains(&actor)
     }
@@ -724,51 +745,36 @@ impl Runtime {
         let enabled = self.enabled(player.actor);
         plan_tree(&*host, config, &player, enabled, tool, origin, true)
     }
-
-    /// Fell a planned tree: the broken block as the game would, then every log
-    /// that is still there, stopping before the tool goes below
-    /// `keepDurability` or if it is swapped; then, if every log came down, the
-    /// planned leaves and the sapling.
-    pub fn fell<H: Host>(
-        &mut self,
-        host: &mut H,
-        config: &Config,
-        plan: &Plan,
-    ) -> Result<Report, H::Error> {
-        self.forget_speed();
-        let mut report = Report::default();
-        let own_wear = config.durability != Durability::PerLog;
-        let origin = MineFlags {
-            keep_durability: own_wear,
-            keep_exhaustion: false,
-        };
-        if !host.mine(plan.origin.0, origin)? {
-            return Ok(report);
-        }
-        report.logs = 1;
-        if own_wear {
-            host.wear(config.wear_of(1));
-        }
-        if config.drops_at_stump {
-            host.gather(Some(plan.origin.0));
-        }
-        let rest = fell_rest(host, config, plan, &mut report);
-        if config.drops_at_stump {
-            host.gather(None);
-        }
-        rest?;
-        if config.replant
-            && !report.stopped
-            && report.changed == 0
-            && let Some(item) = &plan.sapling
-        {
-            report.replanted = host.replant(plan.origin.0, item);
-        }
-        Ok(report)
-    }
 }
 
-fn fell_rest<H: Host>(
+/// Fell a planned tree from the top down: every log that is still there, then
+/// the broken block as the game would, then, if every log came down, the
+/// planned leaves and the sapling. Felling stops before the tool would go
+/// below `keepDurability` (the cut log's own wear kept in reserve) or if it
+/// is swapped; what is left, the cut log with it, stands as a stump. When not
+/// even one log above the cut can come down, the cut log breaks alone, as in
+/// vanilla.
+pub fn fell_tree<H: Host>(host: &mut H, config: &Config, plan: &Plan) -> Result<Report, H::Error> {
+    let mut report = Report::default();
+    if config.drops_at_stump {
+        host.gather(Some(plan.origin.0));
+    }
+    let felled = fell_logs(host, config, plan, &mut report);
+    if config.drops_at_stump {
+        host.gather(None);
+    }
+    felled?;
+    if config.replant
+        && !report.stopped
+        && report.changed == 0
+        && let Some(item) = &plan.sapling
+    {
+        report.replanted = host.replant(plan.origin.0, item);
+    }
+    Ok(report)
+}
+
+fn fell_logs<H: Host>(
     host: &mut H,
     config: &Config,
     plan: &Plan,
@@ -780,16 +786,19 @@ fn fell_rest<H: Host>(
         keep_exhaustion: config.exhaustion == Exhaustion::Once,
     };
     let item = plan.tool.as_ref().map(|t| t.item.as_str());
+    // The cut log counts as the first log for wear, and breaks last.
+    let reserve = config.wear_of(1);
     for (p, block) in &plan.logs {
-        let wear = config.wear_of(report.logs + 1);
+        let wear = config.wear_of(report.logs + 2);
         let tool = host.tool();
+        let needed = u64::from(wear) + u64::from(reserve) + u64::from(config.keep_durability);
         if tool.as_ref().map(|t| t.item.as_str()) != item
             || tool
                 .and_then(|t| t.remaining)
-                .is_some_and(|n| u64::from(n) < u64::from(wear) + u64::from(config.keep_durability))
+                .is_some_and(|n| u64::from(n) < needed)
         {
             report.stopped = true;
-            return Ok(());
+            break;
         }
         if host.block(*p).as_ref() != Some(block) {
             report.changed += 1;
@@ -797,14 +806,30 @@ fn fell_rest<H: Host>(
         }
         if !host.mine(*p, flags)? {
             report.stopped = true;
-            return Ok(());
+            break;
         }
         report.logs += 1;
         if own_wear {
             host.wear(wear);
         }
     }
-    if report.changed > 0 {
+    // Stopped part way: the logs left stand on the cut log, a stump.
+    if report.stopped && report.logs > 0 {
+        return Ok(());
+    }
+    let origin = MineFlags {
+        keep_durability: own_wear,
+        keep_exhaustion: false,
+    };
+    if !host.mine(plan.origin.0, origin)? {
+        report.stopped = true;
+        return Ok(());
+    }
+    report.logs += 1;
+    if own_wear {
+        host.wear(reserve);
+    }
+    if report.stopped || report.changed > 0 {
         return Ok(());
     }
     let leaves = MineFlags {
@@ -819,6 +844,259 @@ fn fell_rest<H: Host>(
     Ok(())
 }
 
+/// The configuration as read from [`CONFIG_FILE`]: Err when the file is broken
+/// (TreeFall is then off until it is fixed or reset).
+pub type Loaded = Result<Config, String>;
+
+/// A button of the settings page (Options > Mods > TreeFall > Settings).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Setting {
+    /// The file is broken: its error. A click reads it again.
+    Broken,
+    Enabled,
+    Tool,
+    Sneak,
+    MaxLogs,
+    MinLeaves,
+    BreakLeaves,
+    /// `breakSpeed`.
+    CutTime,
+    SpeedFactor,
+    MaxSlowdown,
+    /// `durability`.
+    Wear,
+    /// `durabilityFactor`.
+    WearFactor,
+    KeepDurability,
+    /// `exhaustion`.
+    Hunger,
+    DropsAtStump,
+    Replant,
+    Mushrooms,
+    /// The `woods` lists, edited in the file. A click reads it again.
+    Woods,
+    /// Every setting back to its default (the woods lists kept).
+    Defaults,
+}
+/// What a click on the settings page asks of the game.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Effect {
+    /// Write this configuration to the file; it applies at once.
+    Save(Config),
+    /// Read the file again (after editing it by hand).
+    Reload,
+}
+
+/// The steps the numeric settings cycle through (each holds the default).
+pub const MAX_LOGS_STEPS: [usize; 9] = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096];
+pub const MIN_LEAVES_STEPS: [usize; 8] = [0, 1, 3, 5, 10, 20, 50, 100];
+pub const SPEED_FACTOR_STEPS: [f32; 9] = [0.0, 0.1, 0.25, 0.5, 0.75, 1.0, 2.0, 5.0, 10.0];
+pub const MAX_SLOWDOWN_STEPS: [f32; 8] = [1.0, 2.0, 3.0, 5.0, 10.0, 20.0, 50.0, 100.0];
+pub const DURABILITY_FACTOR_STEPS: [f32; 9] = [0.0, 0.1, 0.25, 0.5, 0.75, 1.0, 2.0, 5.0, 10.0];
+pub const KEEP_DURABILITY_STEPS: [u32; 8] = [0, 1, 2, 5, 10, 25, 50, 100];
+/// Longest error shown on the page (the whole one goes to stderr).
+const ERROR_WIDTH: usize = 40;
+
+/// The next step above `now`, back to the first after the last (a value
+/// between two steps goes to the one above it).
+fn step<T: Copy + PartialOrd>(steps: &[T], now: T) -> T {
+    steps.iter().copied().find(|&s| s > now).unwrap_or(steps[0])
+}
+fn on_off(on: bool) -> &'static str {
+    if on { "ON" } else { "OFF" }
+}
+
+/// The page's buttons, in order. A factor shows only in the mode it is for.
+pub fn page(loaded: &Loaded) -> Vec<Setting> {
+    let Ok(c) = loaded else {
+        return vec![Setting::Broken, Setting::Defaults];
+    };
+    let mut page = vec![
+        Setting::Enabled,
+        Setting::Tool,
+        Setting::Sneak,
+        Setting::MaxLogs,
+        Setting::MinLeaves,
+        Setting::BreakLeaves,
+        Setting::CutTime,
+    ];
+    if c.break_speed == BreakSpeed::Scaled {
+        page.extend([Setting::SpeedFactor, Setting::MaxSlowdown]);
+    }
+    page.push(Setting::Wear);
+    if c.durability == Durability::Multiplier {
+        page.push(Setting::WearFactor);
+    }
+    page.extend([
+        Setting::KeepDurability,
+        Setting::Hunger,
+        Setting::DropsAtStump,
+        Setting::Replant,
+        Setting::Mushrooms,
+        Setting::Woods,
+        Setting::Defaults,
+    ]);
+    page
+}
+
+impl Setting {
+    /// Its button's label.
+    pub fn label(self, loaded: &Loaded) -> String {
+        let c = match loaded {
+            Ok(c) => c,
+            Err(error) => {
+                return match self {
+                    Self::Defaults => "Reset to defaults".into(),
+                    _ => {
+                        let mut short: String = error.chars().take(ERROR_WIDTH).collect();
+                        if short.len() < error.len() {
+                            short = format!("{}...", short.trim_end());
+                        }
+                        format!("{CONFIG_FILE}: {short} (click to reload)")
+                    }
+                };
+            }
+        };
+        match self {
+            Self::Broken => String::new(),
+            Self::Enabled => format!("Felling: {}", on_off(c.enabled)),
+            Self::Tool => match c.tool {
+                Tools::Axe => "Tool: axe",
+                Tools::AnyTool => "Tool: any tool",
+                Tools::Any => "Tool: anything, bare hands too",
+            }
+            .into(),
+            Self::Sneak => match c.sneak {
+                Sneak::Disables => "Sneaking: cuts a single log",
+                Sneak::Enables => "Sneaking: needed to fell",
+                Sneak::Ignored => "Sneaking: makes no difference",
+            }
+            .into(),
+            Self::MaxLogs => format!("Largest tree: {} logs", c.max_logs),
+            Self::MinLeaves if c.min_leaves == 0 => "Leaves needed: 0 (any log structure)".into(),
+            Self::MinLeaves => format!("Leaves needed: {}", c.min_leaves),
+            Self::BreakLeaves => format!("Break the leaves: {}", on_off(c.break_leaves)),
+            Self::CutTime => match c.break_speed {
+                BreakSpeed::Single => "Cut time: as one log",
+                BreakSpeed::Scaled => "Cut time: grows with the tree",
+            }
+            .into(),
+            Self::SpeedFactor => format!("Extra time per log: {}x", c.speed_factor),
+            Self::MaxSlowdown => format!("Longest cut: {}x one log", c.max_slowdown),
+            Self::Wear => match c.durability {
+                Durability::PerLog => "Tool wear: every log",
+                Durability::Once => "Tool wear: once per tree",
+                Durability::Multiplier => "Tool wear: logs x factor",
+                Durability::Free => "Tool wear: none",
+            }
+            .into(),
+            Self::WearFactor => format!("Wear factor: {} per log", c.durability_factor),
+            Self::KeepDurability if c.keep_durability == 0 => {
+                "Keep durability: 0 (tool may break)".into()
+            }
+            Self::KeepDurability => format!("Keep durability: {}", c.keep_durability),
+            Self::Hunger => match c.exhaustion {
+                Exhaustion::PerLog => "Hunger: every log",
+                Exhaustion::Once => "Hunger: cut log only",
+            }
+            .into(),
+            Self::DropsAtStump => format!("Drops at the stump: {}", on_off(c.drops_at_stump)),
+            Self::Replant => format!("Replant a sapling: {}", on_off(c.replant)),
+            Self::Mushrooms => format!("Huge mushrooms: {}", on_off(c.mushrooms)),
+            Self::Woods => {
+                let (allow, deny) = (c.woods.allow.len(), c.woods.deny.len());
+                let woods = match (allow, deny) {
+                    (0, 0) => "all".to_owned(),
+                    (0, d) => format!("all but {d}"),
+                    (a, 0) => format!("{a} allowed"),
+                    (a, d) => format!("{a} allowed, {d} denied"),
+                };
+                format!("Woods: {woods} ({CONFIG_FILE}, click to reload)")
+            }
+            Self::Defaults => "Reset to defaults (woods kept)".into(),
+        }
+    }
+
+    /// What a click on it does to `loaded`.
+    pub fn click(self, loaded: &Loaded) -> Effect {
+        let Ok(c) = loaded else {
+            return match self {
+                Self::Defaults => Effect::Save(Config::default()),
+                _ => Effect::Reload,
+            };
+        };
+        let mut c = c.clone();
+        match self {
+            Self::Broken | Self::Woods => return Effect::Reload,
+            Self::Enabled => c.enabled = !c.enabled,
+            Self::Tool => {
+                c.tool = match c.tool {
+                    Tools::Axe => Tools::AnyTool,
+                    Tools::AnyTool => Tools::Any,
+                    Tools::Any => Tools::Axe,
+                }
+            }
+            Self::Sneak => {
+                c.sneak = match c.sneak {
+                    Sneak::Disables => Sneak::Enables,
+                    Sneak::Enables => Sneak::Ignored,
+                    Sneak::Ignored => Sneak::Disables,
+                }
+            }
+            Self::MaxLogs => c.max_logs = step(&MAX_LOGS_STEPS, c.max_logs),
+            Self::MinLeaves => c.min_leaves = step(&MIN_LEAVES_STEPS, c.min_leaves),
+            Self::BreakLeaves => c.break_leaves = !c.break_leaves,
+            Self::CutTime => {
+                c.break_speed = match c.break_speed {
+                    BreakSpeed::Single => BreakSpeed::Scaled,
+                    BreakSpeed::Scaled => BreakSpeed::Single,
+                }
+            }
+            Self::SpeedFactor => c.speed_factor = step(&SPEED_FACTOR_STEPS, c.speed_factor),
+            Self::MaxSlowdown => c.max_slowdown = step(&MAX_SLOWDOWN_STEPS, c.max_slowdown),
+            Self::Wear => {
+                c.durability = match c.durability {
+                    Durability::PerLog => Durability::Once,
+                    Durability::Once => Durability::Multiplier,
+                    Durability::Multiplier => Durability::Free,
+                    Durability::Free => Durability::PerLog,
+                }
+            }
+            Self::WearFactor => {
+                c.durability_factor = step(&DURABILITY_FACTOR_STEPS, c.durability_factor);
+            }
+            Self::KeepDurability => {
+                c.keep_durability = step(&KEEP_DURABILITY_STEPS, c.keep_durability);
+            }
+            Self::Hunger => {
+                c.exhaustion = match c.exhaustion {
+                    Exhaustion::PerLog => Exhaustion::Once,
+                    Exhaustion::Once => Exhaustion::PerLog,
+                }
+            }
+            Self::DropsAtStump => c.drops_at_stump = !c.drops_at_stump,
+            Self::Replant => c.replant = !c.replant,
+            Self::Mushrooms => c.mushrooms = !c.mushrooms,
+            Self::Defaults => {
+                c = Config {
+                    woods: c.woods,
+                    ..Config::default()
+                }
+            }
+        }
+        Effect::Save(c)
+    }
+}
+
+/// The settings page's labels (`native_settings`).
+pub fn labels(loaded: &Loaded) -> Vec<String> {
+    page(loaded).into_iter().map(|s| s.label(loaded)).collect()
+}
+/// A click on button `button` of the page `labels` gave (`native_settings_click`).
+pub fn click(loaded: &Loaded, button: usize) -> Option<Effect> {
+    page(loaded).get(button).map(|s| s.click(loaded))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -831,8 +1109,8 @@ mod tests {
         tool: Option<Tool>,
         calls: Vec<(Position, MineFlags)>,
         fail: BTreeSet<Position>,
-        /// Replace this block after the first mine call.
-        change_after_origin: Option<Position>,
+        /// Replace this block after the first mine call (the top log).
+        change_after_first: Option<Position>,
         gather: Option<Position>,
         /// Where each broken block's drop landed.
         drops: Vec<Position>,
@@ -890,7 +1168,7 @@ mod tests {
                 tool: axe(Some(250)),
                 calls: Vec::new(),
                 fail: BTreeSet::new(),
-                change_after_origin: None,
+                change_after_first: None,
                 gather: None,
                 drops: Vec::new(),
                 exhaustion: 0.0,
@@ -977,7 +1255,7 @@ mod tests {
                 }
             }
             if self.calls.len() == 1
-                && let Some(c) = self.change_after_origin
+                && let Some(c) = self.change_after_first
             {
                 self.blocks.insert(c, block("minecraft:oak_planks"));
             }
@@ -1005,9 +1283,8 @@ mod tests {
         }
     }
     fn fell(w: &mut World, c: &Config, origin: Position) -> Result<Report, Skip> {
-        let mut rt = Runtime::default();
-        let plan = rt.plan(w, c, origin)?;
-        Ok(rt.fell(w, c, &plan).unwrap())
+        let plan = Runtime::default().plan(w, c, origin)?;
+        Ok(fell_tree(w, c, &plan).unwrap())
     }
     fn oak5() -> World {
         let mut w = World::new();
@@ -1070,7 +1347,7 @@ mod tests {
     }
 
     #[test]
-    fn natural_oak_is_felled_top_down_after_the_cut_log() {
+    fn natural_oak_is_felled_top_down_and_the_cut_log_last() {
         let mut w = oak5();
         let r = fell(&mut w, &Config::default(), [0, 64, 0]).unwrap();
         assert_eq!(
@@ -1082,11 +1359,11 @@ mod tests {
         );
         assert_eq!(
             w.mined(),
-            vec![[0, 64, 0], [0, 68, 0], [0, 67, 0], [0, 66, 0], [0, 65, 0]]
+            vec![[0, 68, 0], [0, 67, 0], [0, 66, 0], [0, 65, 0], [0, 64, 0]]
         );
         assert!(w.calls.iter().all(|(_, f)| *f == MineFlags::default()));
         assert_eq!(w.remaining(), Some(245));
-        assert_eq!(w.drops[1], [0, 68, 0]);
+        assert_eq!(w.drops[0], [0, 68, 0]);
         // Leaves stay for natural decay by default.
         assert!(w.blocks.values().any(|b| b.name == "minecraft:oak_leaves"));
     }
@@ -1401,36 +1678,41 @@ mod tests {
 
     #[test]
     fn keep_durability_stops_before_the_tool_goes_below_it() {
+        // 3 points, 1 kept and 1 for the cut log: one log from the top.
         let mut w = oak5();
         w.tool = axe(Some(3));
         let r = fell(&mut w, &Config::default(), [0, 64, 0]).unwrap();
-        assert_eq!((r.logs, r.stopped), (2, true));
-        assert_eq!(w.remaining(), Some(1));
-        // The stump stays standing: the cut log and the top went first.
-        assert!(w.blocks.contains_key(&[0, 65, 0]) && !w.blocks.contains_key(&[0, 68, 0]));
-        // keepDurability 10 from 13: three logs.
+        assert_eq!((r.logs, r.stopped), (1, true));
+        assert_eq!(w.remaining(), Some(2));
+        // The rest stands on the ground as a stump, the cut log with it.
+        assert!((64..68).all(|y| w.blocks.contains_key(&[0, y, 0])));
+        assert!(!w.blocks.contains_key(&[0, 68, 0]));
+        // keepDurability 10 from 13: two logs, the cut log's point kept.
         let mut w = oak5();
         w.tool = axe(Some(13));
         let c = with(|c| c.keep_durability = 10);
-        assert_eq!(fell(&mut w, &c, [0, 64, 0]).unwrap().logs, 3);
-        assert_eq!(w.remaining(), Some(10));
-        // keepDurability 0 may use the axe up.
+        assert_eq!(fell(&mut w, &c, [0, 64, 0]).unwrap().logs, 2);
+        assert_eq!(w.remaining(), Some(11));
+        // keepDurability 0 may use the axe up, on the cut log.
         let mut w = oak5();
-        w.tool = axe(Some(3));
+        w.tool = axe(Some(5));
         let c = with(|c| c.keep_durability = 0);
         let r = fell(&mut w, &c, [0, 64, 0]).unwrap();
-        assert_eq!((r.logs, w.tool.is_none()), (3, true));
+        assert_eq!((r.logs, r.stopped, w.tool.is_none()), (5, false, true));
+        assert_eq!(w.mined().last(), Some(&[0, 64, 0]));
         // With "once" the whole tree costs one use, so a worn axe fells it all.
         let mut w = oak5();
         w.tool = axe(Some(2));
         let c = with(|c| c.durability = Durability::Once);
         assert_eq!(fell(&mut w, &c, [0, 64, 0]).unwrap().logs, 5);
         assert_eq!(w.remaining(), Some(1));
-        // The cut itself always happens, like vanilla, even if it breaks the axe.
+        // Nothing above can come down: the cut log breaks alone, like
+        // vanilla, even if it breaks the axe.
         let mut w = oak5();
         w.tool = axe(Some(1));
         let r = fell(&mut w, &Config::default(), [0, 64, 0]).unwrap();
         assert_eq!((r.logs, r.stopped, w.tool.is_none()), (1, true, true));
+        assert_eq!(w.mined(), vec![[0, 64, 0]]);
         // Durability-less items never stop.
         let mut w = oak5();
         w.tool = axe(None);
@@ -1552,19 +1834,27 @@ mod tests {
 
     #[test]
     fn failed_or_changed_blocks_are_handled() {
+        // The cut log, broken last, fails: the top is down, it stands.
         let mut w = oak5();
         w.fail.insert([0, 64, 0]);
-        assert_eq!(
-            fell(&mut w, &Config::default(), [0, 64, 0]).unwrap().logs,
-            0
-        );
-        assert_eq!(w.calls.len(), 1);
+        let r = fell(&mut w, &Config::default(), [0, 64, 0]).unwrap();
+        assert_eq!((r.logs, r.stopped), (4, true));
+        assert_eq!(w.calls.len(), 5);
+        assert!(w.blocks.contains_key(&[0, 64, 0]));
+        // A log that fails stops the felling: it and the stump stand.
         let mut w = oak5();
         w.fail.insert([0, 67, 0]);
         let r = fell(&mut w, &Config::default(), [0, 64, 0]).unwrap();
-        assert_eq!((r.logs, r.stopped), (2, true));
+        assert_eq!((r.logs, r.stopped), (1, true));
+        assert!((64..68).all(|y| w.blocks.contains_key(&[0, y, 0])));
+        // The first log above the cut fails: the cut log breaks alone.
         let mut w = oak5();
-        w.change_after_origin = Some([0, 66, 0]);
+        w.fail.insert([0, 68, 0]);
+        let r = fell(&mut w, &Config::default(), [0, 64, 0]).unwrap();
+        assert_eq!((r.logs, r.stopped), (1, true));
+        assert!(!w.blocks.contains_key(&[0, 64, 0]));
+        let mut w = oak5();
+        w.change_after_first = Some([0, 66, 0]);
         let r = fell(&mut w, &Config::default(), [0, 64, 0]).unwrap();
         assert_eq!((r.logs, r.changed), (4, 1));
         assert_eq!(w.blocks[&[0, 66, 0]].name, "minecraft:oak_planks");
@@ -1719,20 +2009,11 @@ mod tests {
     #[test]
     fn commands_parse_and_toggle_per_player() {
         assert_eq!(parse_command("treefall"), Some(Ok(Command::Status)));
-        assert_eq!(
-            parse_command("/treefall status"),
-            Some(Ok(Command::Status))
-        );
+        assert_eq!(parse_command("/treefall status"), Some(Ok(Command::Status)));
         assert_eq!(parse_command("treefall  on "), Some(Ok(Command::On)));
         assert_eq!(parse_command("treefall off"), Some(Ok(Command::Off)));
-        assert_eq!(
-            parse_command("treefall toggle"),
-            Some(Ok(Command::Toggle))
-        );
-        assert_eq!(
-            parse_command("treefall reload"),
-            Some(Ok(Command::Reload))
-        );
+        assert_eq!(parse_command("treefall toggle"), Some(Ok(Command::Toggle)));
+        assert_eq!(parse_command("treefall reload"), Some(Ok(Command::Reload)));
         assert_eq!(parse_command("treefall maybe"), Some(Err(USAGE)));
         assert_eq!(parse_command("treefall on now"), Some(Err(USAGE)));
         assert_eq!(parse_command("veinminer on"), None);
@@ -1753,6 +2034,254 @@ mod tests {
         assert!(
             rt.command(a, Command::Status, &off)
                 .ends_with("configuration)")
+        );
+    }
+
+    /// The configuration a click saves (a reload or nothing is a failure).
+    fn saved(loaded: &Loaded, setting: Setting) -> Config {
+        let button = page(loaded).iter().position(|s| *s == setting).unwrap();
+        match click(loaded, button) {
+            Some(Effect::Save(c)) => c,
+            other => panic!("{setting:?}: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn settings_page_lists_every_key_and_the_factors_in_their_mode() {
+        let defaults: Loaded = Ok(Config::default());
+        assert_eq!(
+            labels(&defaults),
+            [
+                "Felling: ON",
+                "Tool: axe",
+                "Sneaking: cuts a single log",
+                "Largest tree: 256 logs",
+                "Leaves needed: 5",
+                "Break the leaves: OFF",
+                "Cut time: as one log",
+                "Tool wear: every log",
+                "Keep durability: 1",
+                "Hunger: every log",
+                "Drops at the stump: OFF",
+                "Replant a sapling: OFF",
+                "Huge mushrooms: OFF",
+                "Woods: all (config.json, click to reload)",
+                "Reset to defaults (woods kept)",
+            ]
+        );
+        // The factors only show in the mode they are for.
+        let scaled: Loaded = Ok(with(|c| {
+            c.break_speed = BreakSpeed::Scaled;
+            c.durability = Durability::Multiplier;
+        }));
+        let shown = labels(&scaled);
+        assert_eq!(shown.len(), 18);
+        assert_eq!(
+            shown[6..9],
+            [
+                "Cut time: grows with the tree",
+                "Extra time per log: 0.5x",
+                "Longest cut: 20x one log",
+            ]
+        );
+        assert_eq!(
+            shown[9..11],
+            ["Tool wear: logs x factor", "Wear factor: 0.5 per log"]
+        );
+        // Every key of the file but the woods lists has its button.
+        let page = page(&scaled);
+        assert_eq!(page.len(), 18);
+        let json = serde_json::to_value(Config::default()).unwrap();
+        assert_eq!(json.as_object().unwrap().len(), page.len() - 1);
+        // Clicks map to the button under the pointer, nothing past the last.
+        assert_eq!(
+            click(&defaults, 0),
+            Some(Effect::Save(with(|c| c.enabled = false)))
+        );
+        assert_eq!(click(&defaults, 13), Some(Effect::Reload));
+        assert_eq!(click(&defaults, 15), None);
+        // Special values say what they do; the woods give their counts.
+        let mut c = with(|c| {
+            c.min_leaves = 0;
+            c.keep_durability = 0;
+        });
+        c.woods.allow.insert("oak".into());
+        c.woods
+            .deny
+            .extend(["birch".to_owned(), "minecraft:spruce".to_owned()]);
+        let shown = labels(&Ok(c));
+        assert!(shown.contains(&"Leaves needed: 0 (any log structure)".to_owned()));
+        assert!(shown.contains(&"Keep durability: 0 (tool may break)".to_owned()));
+        assert!(
+            shown.contains(&"Woods: 1 allowed, 2 denied (config.json, click to reload)".to_owned())
+        );
+    }
+
+    #[test]
+    fn settings_clicks_cycle_every_value_and_stay_valid() {
+        let start = with(|c| {
+            c.break_speed = BreakSpeed::Scaled;
+            c.durability = Durability::Multiplier;
+        });
+        // Each click changes its own key only, and comes back round.
+        // A setting, how many values it has, and how to read it.
+        type Cycle = (Setting, usize, fn(&Config) -> String);
+        let cycles: [Cycle; 15] = [
+            (Setting::Enabled, 2, |c| c.enabled.to_string()),
+            (Setting::Tool, 3, |c| format!("{:?}", c.tool)),
+            (Setting::Sneak, 3, |c| format!("{:?}", c.sneak)),
+            (Setting::MaxLogs, MAX_LOGS_STEPS.len(), |c| {
+                c.max_logs.to_string()
+            }),
+            (Setting::MinLeaves, MIN_LEAVES_STEPS.len(), |c| {
+                c.min_leaves.to_string()
+            }),
+            (Setting::BreakLeaves, 2, |c| c.break_leaves.to_string()),
+            (Setting::SpeedFactor, SPEED_FACTOR_STEPS.len(), |c| {
+                c.speed_factor.to_string()
+            }),
+            (Setting::MaxSlowdown, MAX_SLOWDOWN_STEPS.len(), |c| {
+                c.max_slowdown.to_string()
+            }),
+            (Setting::WearFactor, DURABILITY_FACTOR_STEPS.len(), |c| {
+                c.durability_factor.to_string()
+            }),
+            (Setting::KeepDurability, KEEP_DURABILITY_STEPS.len(), |c| {
+                c.keep_durability.to_string()
+            }),
+            (Setting::Hunger, 2, |c| format!("{:?}", c.exhaustion)),
+            (Setting::DropsAtStump, 2, |c| c.drops_at_stump.to_string()),
+            (Setting::Replant, 2, |c| c.replant.to_string()),
+            (Setting::Mushrooms, 2, |c| c.mushrooms.to_string()),
+            (Setting::CutTime, 2, |c| format!("{:?}", c.break_speed)),
+        ];
+        for (setting, values, read) in cycles {
+            let mut c = start.clone();
+            let mut seen = BTreeSet::new();
+            for _ in 0..values {
+                seen.insert(read(&c));
+                c.validate().unwrap();
+                let next = saved(&Ok(c.clone()), setting);
+                // Nothing else changed.
+                let mut back = next.clone();
+                match setting {
+                    Setting::Enabled => back.enabled = c.enabled,
+                    Setting::Tool => back.tool = c.tool,
+                    Setting::Sneak => back.sneak = c.sneak,
+                    Setting::MaxLogs => back.max_logs = c.max_logs,
+                    Setting::MinLeaves => back.min_leaves = c.min_leaves,
+                    Setting::BreakLeaves => back.break_leaves = c.break_leaves,
+                    Setting::SpeedFactor => back.speed_factor = c.speed_factor,
+                    Setting::MaxSlowdown => back.max_slowdown = c.max_slowdown,
+                    Setting::WearFactor => back.durability_factor = c.durability_factor,
+                    Setting::KeepDurability => back.keep_durability = c.keep_durability,
+                    Setting::Hunger => back.exhaustion = c.exhaustion,
+                    Setting::DropsAtStump => back.drops_at_stump = c.drops_at_stump,
+                    Setting::Replant => back.replant = c.replant,
+                    Setting::Mushrooms => back.mushrooms = c.mushrooms,
+                    _ => back.break_speed = c.break_speed,
+                }
+                assert_eq!(back, c, "{setting:?}");
+                c = next;
+            }
+            assert_eq!(seen.len(), values, "{setting:?} {seen:?}");
+            assert_eq!(c, start, "{setting:?} comes back round");
+        }
+        // Tool wear cycles its four modes (its factor's button comes and goes).
+        let mut c = Config::default();
+        let mut modes = Vec::new();
+        for _ in 0..4 {
+            c = saved(&Ok(c), Setting::Wear);
+            modes.push(c.durability);
+        }
+        assert_eq!(
+            modes,
+            [
+                Durability::Once,
+                Durability::Multiplier,
+                Durability::Free,
+                Durability::PerLog
+            ]
+        );
+        // A hand-written value between two steps goes to the step above it,
+        // the largest back to the smallest.
+        let c = with(|c| {
+            c.max_logs = 300;
+            c.speed_factor = 0.3;
+            c.break_speed = BreakSpeed::Scaled;
+            c.keep_durability = 100_000;
+        });
+        assert_eq!(saved(&Ok(c.clone()), Setting::MaxLogs).max_logs, 512);
+        assert_eq!(
+            saved(&Ok(c.clone()), Setting::SpeedFactor).speed_factor,
+            0.5
+        );
+        assert_eq!(saved(&Ok(c), Setting::KeepDurability).keep_durability, 0);
+        // Every step is a valid value, and the defaults are steps.
+        let d = Config::default();
+        assert!(MAX_LOGS_STEPS.contains(&d.max_logs) && MIN_LEAVES_STEPS.contains(&d.min_leaves));
+        assert!(SPEED_FACTOR_STEPS.contains(&d.speed_factor));
+        assert!(MAX_SLOWDOWN_STEPS.contains(&d.max_slowdown));
+        assert!(DURABILITY_FACTOR_STEPS.contains(&d.durability_factor));
+        assert!(KEEP_DURABILITY_STEPS.contains(&d.keep_durability));
+    }
+
+    #[test]
+    fn settings_reset_reload_and_a_broken_file() {
+        // Reset keeps the woods lists, which only the file holds.
+        let mut c = with(|c| {
+            c.max_logs = 64;
+            c.tool = Tools::Any;
+        });
+        c.woods.deny.insert("birch".into());
+        let reset = saved(&Ok(c.clone()), Setting::Defaults);
+        assert_eq!(reset.woods, c.woods);
+        assert_eq!(
+            Config {
+                woods: Woods::default(),
+                ..reset
+            },
+            Config::default()
+        );
+        // The woods button reads the file again.
+        assert_eq!(Setting::Woods.click(&Ok(c)), Effect::Reload);
+        // A broken file: its error (cut short) and a reset, nothing else.
+        let error =
+            "unknown field `mustSneak`, expected one of `enabled`, `sneak`, `tool`".to_owned();
+        let broken: Loaded = Err(error.clone());
+        assert_eq!(page(&broken), [Setting::Broken, Setting::Defaults]);
+        let shown = labels(&broken);
+        assert_eq!(
+            shown[0],
+            "config.json: unknown field `mustSneak`, expected one... (click to reload)"
+        );
+        assert_eq!(shown[1], "Reset to defaults");
+        assert_eq!(click(&broken, 0), Some(Effect::Reload));
+        assert_eq!(click(&broken, 1), Some(Effect::Save(Config::default())));
+        assert_eq!(click(&broken, 2), None);
+        let short: Loaded = Err("expected value at line 1 column 1".into());
+        assert_eq!(
+            labels(&short)[0],
+            "config.json: expected value at line 1 column 1 (click to reload)"
+        );
+    }
+
+    #[test]
+    fn settings_are_saved_as_the_file_they_are_read_from() {
+        let mut c = with(|c| {
+            c.durability = Durability::Free;
+            c.speed_factor = 0.1;
+            c.keep_durability = 25;
+        });
+        c.woods.allow.insert("minecraft:cherry".into());
+        let json = c.to_json();
+        assert!(json.ends_with("}\n"));
+        assert!(json.contains("\"durability\": \"none\""));
+        assert!(json.contains("\"speedFactor\": 0.1"));
+        assert_eq!(Config::from_json(&json).unwrap(), c);
+        assert_eq!(
+            Config::from_json(&Config::default().to_json()).unwrap(),
+            Config::default()
         );
     }
 }

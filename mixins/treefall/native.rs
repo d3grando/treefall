@@ -1,71 +1,105 @@
-// TreeFall's native adapter for Horizon 83f15fa276c44711276b6ceb5f0fe0c9c534dc66.
-// Injected as `crate::game::treefall_native`; binds the game-independent engine
-// in `crate::game::treefall` (runtime.rs) to the running game.
+// TreeFall's adapter to the game (Horizon 142388e1c136e622652ec7505af15d8ad195e041,
+// see horizon-mixin.toml). Injected as `crate::game::treefall_native`; binds the
+// game-independent engine in `crate::game::treefall` (runtime.rs) to the running
+// game, and keeps the settings where the native hook points' helpers do.
 use super::treefall::{
-    BreakSpeed, Block, Blocks, Command, Config, Host, Kind, MineFlags, Player, Position, Runtime,
-    SpeedKey, Tool, plan_tree,
+    self as tf, Block, Blocks, BreakSpeed, Command, Config, Effect, Host, Kind, Loaded, MineFlags,
+    Player, Position, Runtime, SpeedKey, Tool, fell_tree, plan_tree,
 };
 use super::{Game, Result};
+use std::sync::atomic::{AtomicU8, Ordering};
 
-#[derive(Default)]
-struct State {
+/// What the window's game and single player's server thread share (single
+/// player runs on its own "Server thread", one process): the configuration,
+/// the players who turned TreeFall off, and the last felling-speed answer.
+/// The window mines on its own side too, so it needs the same answers to cut
+/// as slowly as the server (`breakSpeed: "scaled"`).
+struct Shared {
     runtime: Runtime,
-    config: Option<Config>,
+    /// `config.json` as last read; None until something needs it.
+    config: Option<Loaded>,
 }
+static SHARED: std::sync::Mutex<Shared> = std::sync::Mutex::new(Shared {
+    runtime: Runtime::new(),
+    config: None,
+});
+/// Options > Mods' on/off as the window's game last saw it (`WINDOW_UNSEEN`,
+/// `WINDOW_ON`, `WINDOW_OFF`): single player's server thread keeps the
+/// options it started with, so it follows the window when there is one.
+static WINDOW: AtomicU8 = AtomicU8::new(WINDOW_UNSEEN);
+const WINDOW_UNSEEN: u8 = 0;
+const WINDOW_ON: u8 = 1;
+const WINDOW_OFF: u8 = 2;
 
 thread_local! {
-    // Per world, on the thread that runs the game (like the game's own state).
-    static STATES: std::cell::RefCell<std::collections::BTreeMap<std::path::PathBuf, State>> =
-        const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
     // Where the drops of the blocks being felled go (`dropsAtStump`).
     static GATHER: std::cell::Cell<Option<Position>> = const { std::cell::Cell::new(None) };
     // Set while `destroy_progress` runs the game's own computation.
     static MEASURING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
-fn with_state<T>(key: &std::path::Path, run: impl FnOnce(&mut State) -> T) -> T {
-    struct Lease {
-        key: std::path::PathBuf,
-        state: State,
-    }
-    impl Drop for Lease {
-        fn drop(&mut self) {
-            STATES.with(|states| {
-                states
-                    .borrow_mut()
-                    .insert(self.key.clone(), std::mem::take(&mut self.state));
-            });
-        }
-    }
-    let state = STATES.with(|states| states.borrow_mut().remove(key).unwrap_or_default());
-    let mut lease = Lease {
-        key: key.to_owned(),
-        state,
-    };
-    run(&mut lease.state)
+/// Never held while the game runs a hook of ours.
+fn shared<T>(run: impl FnOnce(&mut Shared) -> T) -> T {
+    let mut shared = SHARED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    run(&mut shared)
 }
 
-fn load_config() -> std::result::Result<Config, String> {
-    match std::env::var_os(super::treefall::CONFIG_ENV) {
-        Some(path) => {
-            let path = std::path::PathBuf::from(path);
-            Config::from_json(
-                &std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?,
-            )
-        }
+/// `config.json` in the mod's settings folder; missing is the defaults.
+fn read_config(game: &Game<'_>) -> Loaded {
+    match game.native_setting(tf::ID, tf::CONFIG_FILE) {
+        Some(text) => Config::from_json(&text).map_err(|e| format!("{}: {e}", tf::CONFIG_FILE)),
         None => Ok(Config::default()),
     }
 }
-/// The loaded configuration; a broken file disables the mod (fails closed).
-fn config(state: &mut State) -> &Config {
-    state.config.get_or_insert_with(|| {
-        load_config().unwrap_or_else(|error| {
-            eprintln!("TreeFall disabled: {error}");
-            Config {
-                enabled: false,
-                ..Config::default()
-            }
-        })
+/// Puts `loaded` in effect, for every player at once.
+fn apply(loaded: Loaded) {
+    if let Err(error) = &loaded {
+        eprintln!("TreeFall disabled: {error}");
+    }
+    shared(|s| {
+        s.config = Some(loaded);
+        s.runtime.forget_speed();
+    });
+}
+/// The configuration as read (once, by whichever thread needs it first).
+fn loaded(game: &Game<'_>) -> Loaded {
+    if let Some(loaded) = shared(|s| s.config.clone()) {
+        return loaded;
+    }
+    let read = read_config(game);
+    shared(|s| {
+        s.config
+            .get_or_insert_with(|| {
+                if let Err(error) = &read {
+                    eprintln!("TreeFall disabled: {error}");
+                }
+                read
+            })
+            .clone()
     })
+}
+/// The configuration in effect: a broken file disables the mod (fails closed).
+fn config(game: &Game<'_>) -> Config {
+    loaded(game).unwrap_or_else(|_| Config {
+        enabled: false,
+        ..Config::default()
+    })
+}
+/// Not turned off in Options > Mods: every hook passes through untouched
+/// when this is false (the list and settings hooks still run, so the row
+/// can turn it back on).
+fn on(game: &Game<'_>) -> bool {
+    let own = game.native_on(tf::ID);
+    if game.native_window() {
+        let seen = if own { WINDOW_ON } else { WINDOW_OFF };
+        WINDOW.store(seen, Ordering::Relaxed);
+        return own;
+    }
+    match WINDOW.load(Ordering::Relaxed) {
+        WINDOW_UNSEEN => own,
+        seen => seen == WINDOW_ON,
+    }
 }
 
 /// Read-only view of the game: blocks, the acting player and their tool.
@@ -121,7 +155,11 @@ impl View<'_, '_> {
         let game = self.0;
         Player {
             actor,
-            survival: game.remote.is_none()
+            // Survival or adventure in a world of this game's own: played in
+            // the frame, hosted, or single player's server thread and the
+            // window joined to it (which mines on its side too). Never as a
+            // client of another computer's server.
+            survival: game.has_singleplayer_server()
                 && game.player.is_some()
                 && !game.creative
                 && !game.spectator(),
@@ -131,12 +169,16 @@ impl View<'_, '_> {
                 || game.player.as_ref().is_some_and(|p| p.shift_key_down),
         }
     }
-    /// `acting_player_uuid` without its `&mut` (the host's UUID is set once a
-    /// command or a break has asked for it).
+    /// The acting player, as the server knows them: a LAN guest (single
+    /// player's own window is one of its server thread), the window's profile
+    /// when joined to a server, else the world's player. `acting_player_uuid`
+    /// without its `&mut`.
     fn actor(&self) -> [i32; 4] {
-        match self.0.lan_acting_uuid {
-            Some(guest) => horizon_client::lan::playerdata::uuid_ints(guest),
-            None => self.0.level.player_uuid.unwrap_or_default(),
+        let game = self.0;
+        match (game.lan_acting_uuid, &game.remote) {
+            (Some(guest), _) => horizon_client::lan::playerdata::uuid_ints(guest),
+            (None, Some(remote)) => horizon_client::lan::playerdata::uuid_ints(remote.profile()),
+            (None, None) => game.level.player_uuid.unwrap_or_default(),
         }
     }
     fn tool(&self) -> Option<Tool> {
@@ -206,7 +248,8 @@ impl Host for Native<'_, '_> {
         result?;
         Ok(before.is_some() && self.block(p) != before)
     }
-    /// `ItemStack.hurtAndBreak` for the held tool, as `mine_block_with_held` does it.
+    /// `ItemStack.hurtAndBreak` for the held tool, as `mine_block_with_held`
+    /// does it (Unbreaking applies).
     fn wear(&mut self, amount: u32) {
         let selected = self.game.selected;
         if amount == 0 {
@@ -224,7 +267,6 @@ impl Host for Native<'_, '_> {
         if max == 0 {
             return;
         }
-        self.game.trigger_item_durability(&stack);
         let loss = self.game.durability_loss(&stack, amount);
         if let Some(held) = self.game.inventory[selected].as_mut() {
             held.damage += loss;
@@ -247,7 +289,10 @@ impl Host for Native<'_, '_> {
         if slot.is_none() && !offhand {
             return false;
         }
-        let free = game.res.facts().is_air(game.world.block(at[0], at[1], at[2]));
+        let free = game
+            .res
+            .facts()
+            .is_air(game.world.block(at[0], at[1], at[2]));
         let survives = free
             && game.with_level(|b, level, ticks| {
                 b.can_survive(
@@ -277,47 +322,46 @@ impl Host for Native<'_, '_> {
 impl Game<'_> {
     /// `Game::break_block`'s HEAD: Some when the break fells a tree (the whole
     /// break, the clicked block included, happened here), None to let the
-    /// game (and lower-priority hooks) break the block as usual.
+    /// game (and lower-priority hooks) break the block as usual. Only the
+    /// game that owns the world fells (not a window joined to a server).
     pub(super) fn treefall_break_block(&mut self, pos: Position) -> Option<Result<()>> {
-        let key = self.world_root.clone();
-        with_state(&key, |state| {
-            let config = config(state).clone();
-            let plan = state
-                .runtime
-                .plan(&mut Native { game: self }, &config, pos)
-                .ok()?;
-            let runtime = &mut state.runtime;
-            Some(self.with_player_actor(|game| {
-                let result = runtime.fell(&mut Native { game }, &config, &plan);
-                GATHER.set(None);
-                result.map(|_| ())
-            }))
-        })
+        if !on(self) || self.remote.is_some() {
+            return None;
+        }
+        let config = config(self);
+        let plan = shared(|s| s.runtime.plan(&mut Native { game: self }, &config, pos)).ok()?;
+        shared(|s| s.runtime.forget_speed());
+        Some(self.with_player_actor(|game| {
+            let result = fell_tree(&mut Native { game }, &config, &plan);
+            GATHER.set(None);
+            result.map(|_| ())
+        }))
     }
 
     /// `Game::destroy_progress`'s HEAD (`breakSpeed: "scaled"`): the cut
     /// log's progress per tick divided by the tree's slowdown; None leaves the
-    /// game's own value.
+    /// game's own value. Asked by the game that owns the world and, in single
+    /// player, by the window as it mines too, so both cut as slowly.
     pub(super) fn treefall_destroy_progress(&self, pos: Position) -> Option<f32> {
-        if MEASURING.get() {
+        if MEASURING.get() || !on(self) {
+            return None;
+        }
+        let config = config(self);
+        if config.break_speed == BreakSpeed::Single || !config.enabled {
             return None;
         }
         let view = View(self);
-        let slowdown = with_state(&self.world_root, |state| {
-            let config = config(state).clone();
-            if config.break_speed == BreakSpeed::Single || !config.enabled {
-                return 1.0;
-            }
-            let actor = view.actor();
-            let tool = view.tool();
-            let key = SpeedKey {
-                actor,
-                position: pos,
-                state: self.world.block(pos[0], pos[1], pos[2]).0,
-                item: tool.as_ref().map(|t| t.item.clone()),
-            };
-            let enabled = state.runtime.enabled(actor);
-            state.runtime.slowdown(key, self.world.game_time, || {
+        let actor = view.actor();
+        let tool = view.tool();
+        let key = SpeedKey {
+            actor,
+            position: pos,
+            state: self.world.block(pos[0], pos[1], pos[2]).0,
+            item: tool.as_ref().map(|t| t.item.clone()),
+        };
+        let slowdown = shared(|s| {
+            let enabled = s.runtime.enabled(actor);
+            s.runtime.slowdown(key, self.world.game_time, || {
                 let player = view.player(actor);
                 plan_tree(&view, &config, &player, enabled, tool, pos, false)
                     .map_or(1.0, |plan| plan.slowdown(&config))
@@ -338,7 +382,8 @@ impl Game<'_> {
     }
 
     /// `Game::pop_resource`'s HEAD (`dropsAtStump`): while a tree is felled,
-    /// pop `stack` at the stump instead; false leaves it where it is.
+    /// pop `stack` at the stump instead; false leaves it where it is. Only a
+    /// felling sets the stump, so this passes through when TreeFall is off.
     pub(super) fn treefall_pop_at_stump(
         &mut self,
         pos: Position,
@@ -356,43 +401,97 @@ impl Game<'_> {
         true
     }
 
-    /// `/treefall [status|on|off|toggle|reload]`; None for other commands.
-    pub(super) fn treefall_command(&mut self, command: &str) -> Option<bool> {
-        let parsed = super::treefall::parse_command(command)?;
-        let key = self.world_root.clone();
-        with_state(&key, |state| {
-            let message = match parsed {
-                Err(usage) => {
-                    self.command_failure(horizon_client::text::Text::literal(usage));
-                    return Some(false);
+    /// `native_command` (a hook point): `/treefall [status|on|off|toggle|reload]`;
+    /// true when it was TreeFall's. The game that owns the world runs it: a
+    /// window joined to a server (single player's server thread included)
+    /// leaves the line to the server, as a guest's command reaches it there.
+    pub(super) fn treefall_command(&mut self, command: &str) -> bool {
+        if !on(self) || self.remote.is_some() {
+            return false;
+        }
+        let Some(parsed) = tf::parse_command(command) else {
+            return false;
+        };
+        let message = match parsed {
+            Err(usage) => {
+                self.command_failure(horizon_client::text::Text::literal(usage));
+                return true;
+            }
+            Ok(Command::Reload) => {
+                if self.ui.registries.permission < 2 {
+                    self.command_failure(horizon_client::text::Text::literal(
+                        "TreeFall reload requires permission level 2",
+                    ));
+                    return true;
                 }
-                Ok(Command::Reload) => {
-                    if self.ui.registries.permission < 2 {
-                        self.command_failure(horizon_client::text::Text::literal(
-                            "TreeFall reload requires permission level 2",
-                        ));
-                        return Some(false);
+                match read_config(self) {
+                    Ok(config) => {
+                        apply(Ok(config));
+                        "TreeFall configuration reloaded".to_owned()
                     }
-                    match load_config() {
-                        Ok(config) => {
-                            state.config = Some(config);
-                            state.runtime.forget_speed();
-                            "TreeFall configuration reloaded".to_owned()
-                        }
-                        Err(error) => {
-                            self.command_failure(horizon_client::text::Text::literal(error));
-                            return Some(false);
-                        }
+                    Err(error) => {
+                        self.command_failure(horizon_client::text::Text::literal(error));
+                        return true;
                     }
                 }
-                Ok(command) => {
-                    let actor = self.acting_player_uuid();
-                    let config = config(state).clone();
-                    state.runtime.command(actor, command, &config)
-                }
-            };
-            self.system_message(horizon_client::text::Text::literal(message));
-            Some(true)
-        })
+            }
+            Ok(command) => {
+                let actor = self.acting_player_uuid();
+                let config = config(self);
+                shared(|s| s.runtime.command(actor, command, &config))
+            }
+        };
+        self.system_message(horizon_client::text::Text::literal(message));
+        true
+    }
+
+    /// `lan_actions::Game::guest_command`'s HEAD: queue a LAN guest's
+    /// `/treefall` so it runs as that guest (their own on/off state), whatever
+    /// their permission level; true when it was one.
+    pub(super) fn treefall_guest_command(
+        &mut self,
+        host: &mut super::lan::LanHost,
+        conn: u32,
+        command: &str,
+    ) -> bool {
+        if !on(self) || !tf::is_command(command) {
+            return false;
+        }
+        if let Some(permission) = host.hub.guest(conn).map(|g| g.permission) {
+            host.commands.push(super::lan_actions::GuestCommand {
+                conn,
+                command: command.trim().trim_start_matches('/').to_owned(),
+                permission,
+                integrated: host.hub.config.integrated,
+                quiet: false,
+            });
+        }
+        true
+    }
+
+    /// `native_tick` (a hook point): the window's game notes each tick
+    /// whether TreeFall is turned off in Options > Mods, for its server thread.
+    pub(super) fn treefall_tick(&self) {
+        if self.native_window() {
+            on(self);
+        }
+    }
+
+    /// `native_settings` (a hook point): the settings page's buttons.
+    pub(super) fn treefall_settings(&self) -> Vec<String> {
+        tf::labels(&loaded(self))
+    }
+
+    /// `native_settings_click` (a hook point): change the setting, write
+    /// `config.json` and put it in effect at once (or read the file again).
+    pub(super) fn treefall_settings_click(&mut self, button: usize) {
+        match tf::click(&loaded(self), button) {
+            Some(Effect::Save(config)) => {
+                self.native_set_setting(tf::ID, tf::CONFIG_FILE, &config.to_json());
+                apply(Ok(config));
+            }
+            Some(Effect::Reload) => apply(read_config(self)),
+            None => {}
+        }
     }
 }
