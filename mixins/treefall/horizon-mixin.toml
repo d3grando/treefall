@@ -1,0 +1,79 @@
+[mod]
+id = "treefall"
+version = "0.2.0"
+# Above Veinminer (100): same-site HEAD hooks run by priority, highest first, and
+# the first Break skips the rest, so a felled tree is never also vein-mined.
+priority = 200
+
+[compatibility]
+horizon_revision = "83f15fa276c44711276b6ceb5f0fe0c9c534dc66"
+
+[[module]]
+id = "runtime"
+file = "crates/horizon-client/src/game.rs"
+name = "treefall"
+source = "runtime.rs"
+
+[[module]]
+id = "native"
+file = "crates/horizon-client/src/game.rs"
+name = "treefall_native"
+source = "native.rs"
+
+[[injection]]
+id = "mining"
+kind = "HEAD"
+cancellable = true
+target = "horizon_client::game::Game<'_>::break_block"
+helper = "mining.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "pos", ty = "[i32;3]", value = "pos" },
+]
+
+[[injection]]
+id = "command"
+kind = "HEAD"
+cancellable = true
+target = "horizon_client::game::commands::Game<'_>::run_command"
+helper = "command.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "command", ty = "&str", value = "command" },
+]
+
+[[injection]]
+id = "guest-command"
+kind = "HEAD"
+cancellable = true
+target = "horizon_client::game::lan_actions::Game<'_>::guest_command"
+helper = "guest-command.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "host", ty = "&mut crate::game::lan::LanHost", value = "&mut *host" },
+  { name = "conn", ty = "u32", value = "conn" },
+  { name = "command", ty = "&str", value = "command" },
+]
+
+[[injection]]
+id = "speed"
+kind = "HEAD"
+cancellable = true
+target = "horizon_client::game::hand::Game<'_>::destroy_progress"
+helper = "speed.rs"
+bindings = [
+  { name = "game", ty = "&crate::game::Game<'_>", value = "self" },
+  { name = "pos", ty = "[i32;3]", value = "pos" },
+]
+
+[[injection]]
+id = "drops"
+kind = "HEAD"
+cancellable = true
+target = "horizon_client::game::Game<'_>::pop_resource"
+helper = "drops.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "pos", ty = "[i32;3]", value = "pos" },
+  { name = "stack", ty = "&mut horizon_client::items::ItemStack", value = "&mut stack" },
+]
