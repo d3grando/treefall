@@ -10,7 +10,7 @@ priority = 200
 # speed, drops or LAN guests' commands), so the mod is made for this one commit.
 # Its other hooks use only hook points (NATIVE_HOOKS_API 1).
 [compatibility]
-horizon_revision = "142388e1c136e622652ec7505af15d8ad195e041"
+horizon_revision = "aa27eca326db26e999d4e59d7899576016764b1e"
 
 [[module]]
 id = "runtime"
@@ -44,7 +44,7 @@ cancellable = true
 target = "horizon_client::game::hand::Game<'_>::destroy_progress"
 helper = "speed.rs"
 bindings = [
-  { name = "game", ty = "&crate::game::Game<'_>", value = "self" },
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
   { name = "pos", ty = "[i32;3]", value = "pos" },
 ]
 
