@@ -1,4 +1,4 @@
-// TreeFall's adapter to the game (Horizon aa27eca326db26e999d4e59d7899576016764b1e,
+// TreeFall's adapter to the game (Horizon fdc87aecdbd116bf1e08adcd062fcbaea8c2e2ca,
 // see horizon-mixin.toml). Injected as `crate::game::treefall_native`; binds the
 // game-independent engine in `crate::game::treefall` (runtime.rs) to the running
 // game, and keeps the settings where the native hook points' helpers do.

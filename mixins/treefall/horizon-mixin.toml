@@ -10,7 +10,7 @@ priority = 200
 # speed, drops or LAN guests' commands), so the mod is made for this one commit.
 # Its other hooks use only hook points (NATIVE_HOOKS_API 1).
 [compatibility]
-horizon_revision = "aa27eca326db26e999d4e59d7899576016764b1e"
+horizon_revision = "fdc87aecdbd116bf1e08adcd062fcbaea8c2e2ca"
 
 [[module]]
 id = "runtime"
